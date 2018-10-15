@@ -25,9 +25,11 @@ import io.prometheus.client.Summary;
 import io.prometheus.client.Gauge;
 import org.jenkinsci.plugins.prometheus.config.PrometheusConfiguration;
 
-public class JobCollector extends Collector { 
+public class JobCollector extends Collector {
     private static final Logger logger = LoggerFactory.getLogger(JobCollector.class);
 
+    final List<String> runs = new ArrayList<>();
+    private Summary repoSummary;
     private Summary summary;
     private Gauge jobBuildResultOrdinal;
     private Gauge jobBuildResult;
@@ -63,6 +65,15 @@ public class JobCollector extends Collector {
             !PrometheusConfiguration.get().isCountUnstableBuilds();
 
         logger.debug("getting summary of build times in milliseconds by Job");
+        if (repoSummary == null) {
+            repoSummary = Summary.build().
+                    name(fullname + "repo_duration_milliseconds_summary").
+                    subsystem(subsystem).namespace(namespace).
+                    labelNames("repo").
+                    help("Summary of Jenkins build times in milliseconds by repository").
+                    create();
+        }
+
         summary = Summary.build().
                 name(fullname + "_duration_milliseconds_summary").
                 subsystem(subsystem).namespace(namespace).
@@ -155,6 +166,10 @@ public class JobCollector extends Collector {
                 appendJobMetrics(job, ignoreBuildMetrics);
             }
         });
+        if (repoSummary.collect().get(0).samples.size() > 0){
+            logger.debug("Adding [{}] samples from summary", repoSummary.collect().get(0).samples.size());
+            samples.addAll(repoSummary.collect());
+        }
         if (summary.collect().get(0).samples.size() > 0){
             logger.debug("Adding [{}] samples from summary", summary.collect().get(0).samples.size());
             samples.addAll(summary.collect());
@@ -196,9 +211,11 @@ public class JobCollector extends Collector {
     }
 
     protected void appendJobMetrics(Job job, Boolean ignoreBuildMetrics) {
-        // Add this to the repo as well so I can group by Github Repository 
-        String repoName = StringUtils.substringBetween(job.getFullName(), "/");
-        if (repoName == null) {
+        // Add this to the repo as well so I can group by Github Repository
+        String repoName = job.getFullName();
+        try {
+            repoName = repoName.substring(0, repoName.lastIndexOf("/"));
+        } catch (Exception e) {
             repoName="NA";
         }
         String[] labelValueArray = {job.getFullName(),repoName};
@@ -212,7 +229,7 @@ public class JobCollector extends Collector {
 
         /*
          * _last_build_result _last_build_result_ordinal
-         * 
+         *
          * SUCCESS   0 true  - The build had no errors.
          * UNSTABLE  1 true  - The build had some errors but they were not fatal. For example, some tests failed.
          * FAILURE   2 false - The build had a fatal error.
@@ -256,6 +273,12 @@ public class JobCollector extends Collector {
                 long buildDuration = run.getDuration();
                 logger.debug("duration is [{}] for run [{}] from job [{}]", buildDuration, run.getNumber(), job.getName());
                 summary.labels(labelValueArray).observe(buildDuration);
+                String jobRun = String.format("%s-%d", job.getFullName(), run.getNumber());
+                // Aggregate by repo
+                if (!runs.contains(jobRun)) {
+                    repoSummary.labels(repoName).observe(buildDuration);
+                    runs.add(jobRun);
+                }
 
                 if (run instanceof WorkflowRun) {
                     logger.debug("run [{}] from job [{}] is of type workflowRun", run.getNumber(), job.getName());
@@ -279,8 +302,10 @@ public class JobCollector extends Collector {
     private void observeStage(Job job, Run run, FlowNode stage) {
         logger.debug("Observing stage[{}] in run [{}] from job [{}]", stage.getDisplayName(), run.getNumber(), job.getName());
         // Add this to the repo as well so I can group by Github Repository
-        String repoName = StringUtils.substringBetween(job.getFullName(), "/");
-        if (repoName == null) {
+        String repoName = job.getFullName();
+        try {
+            repoName = repoName.substring(0, repoName.lastIndexOf("/"));
+        } catch (Exception e) {
             repoName="NA";
         }
         String jobName = job.getFullName();
@@ -291,6 +316,8 @@ public class JobCollector extends Collector {
         long duration = FlowNodes.getStageDuration(stage);
         logger.debug("duration was [{}] for stage[{}] in run [{}] from job [{}]", duration, stage.getDisplayName(), run.getNumber(), job.getName());
         stageSummary.labels(labelValueArray).observe(duration);
+        // Aggregate by repo
+        stageSummary.labels(new String[]{repoName, repoName}).observe(duration);
     }
 
     private boolean hasTestResults(Run<?, ?> job) {
